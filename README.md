@@ -42,9 +42,9 @@ with torch.no_grad():
 
 ## Results
 
-Training curves (train loss / val loss / PPL):
-- Epoch 1: val loss ~2.5, PPL ~12
-- Epoch 5 (target): val loss ~0.8, PPL ~2.2
+Training progress (Step 1100, epoch 1 of 5):
+- Loss: 0.45 | PPL: 1.6 | LR: 1e-4 | Speed: ~28K tokens/s
+- Epoch 1/5 checkpoint saved after training completes (~1.8h/epoch)
 
 Mutation fitness evaluation (Spearman ρ on test set):
 - Tracks masked LM logit differences between WT and mutant
@@ -53,8 +53,28 @@ Mutation fitness evaluation (Spearman ρ on test set):
 
 ```
 train.py          # Full training script
+download_data.py  # Swiss-Prot data downloader
+requirements.txt  # Python dependencies
 data/             # Swiss-Prot FASTA (download via script)
-output/           # Checkpoints (after training)
+output/           # Checkpoints (after training):
+                    checkpoint_epoch*.pt     # per-epoch ckpts
+                    checkpoint_step*.pt      # intermediate ckpts
+                    checkpoint_final.pt      # final model
+                    checkpoint_final_best.pt # best val loss model
+                    config.json              # training config
+```
+
+## Training from scratch
+
+```bash
+# 1. Download training data
+python download_data.py
+
+# 2. Train (MLU370)
+bash start_training.sh
+
+# 3. Resume if interrupted
+python train.py --resume output/checkpoint_epoch2.pt
 ```
 
 ## License
