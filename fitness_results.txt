@@ -1,0 +1,10 @@
+GFP Fluorescence Mutation Predictions
+=======================================
+
+Spearman ρ = 0.200 (CPU inference, zero-shot)
+
+Mutations tested:
+  K7V (neutral   ) | WT=1.39 | Mut=1.52 | Δ=+0.13
+  K7I (neutral   ) | WT=1.39 | Mut=0.40 | Δ=-0.99
+  G66Y (brighter  ) | WT=1.70 | Mut=0.33 | Δ=-1.37
+  G66H (dimer     ) | WT=1.70 | Mut=0.32 | Δ=-1.38

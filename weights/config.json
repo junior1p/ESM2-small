@@ -1,0 +1,11 @@
+{
+  "n_params": 9624607,
+  "vocab_size": 31,
+  "max_len": 512,
+  "batch_size": 32,
+  "lr": 0.0001,
+  "epochs": 5,
+  "warmup_steps": 1000,
+  "n_train": 433583,
+  "n_val": 22821
+}

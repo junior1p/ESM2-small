@@ -9,23 +9,37 @@ Architecture mirrors [ESM-2](https://facebookresearch.github.io/esm/):
 
 ## Training
 
-- **Data**: [Swiss-Prot](https://rest.uniprot.org) curated protein sequences (456,404 train / 22,821 val)
-- **Device**: MLU370 (Cambricon) — 1 card
-- **Batch**: 32 × 512 tokens = 16K tokens/step
-- **Speed**: ~2 steps/s (~30K tokens/s)
-- **Epochs**: 5 epochs (~1.8h/epoch)
-- **Optimizer**: AdamW (lr=1e-4, warmup=1000 steps, cosine decay)
-- **Output**: `checkpoint_final.pt` + per-epoch checkpoints
+| Parameter | Value |
+|---|---|
+| Data | Swiss-Prot (456,404 train / 22,821 val) |
+| Device | MLU370 (Cambricon) — 1 card |
+| Batch | 32 × 512 tokens |
+| Speed | ~30K tokens/s |
+| Epochs | 5 (~2h/epoch, total ~10h) |
+| Optimizer | AdamW (lr=1e-4, warmup=1000 steps, cosine decay) |
+| Final val loss | **0.4170** |
+
+### Training Progress
+
+| Epoch | Val Loss | Notes |
+|---|---|---|
+| 1 | 0.4195 | checkpoint ~38MB (EMA) |
+| 2 | 0.4235 | — |
+| 3 | 0.4182 | best so far |
+| 4 | 0.4185 | — |
+| 5 | 0.4179 | final epoch |
+| **Final** | **0.4170** | checkpoint_final_best.pt |
 
 ## Quick Start
 
 ```python
-import torch, train
+import torch
+import train
 
 # Load tokenizer & model
-tokenizer = train.ProteinTokenizer()
+tokenizer = train.get_tokenizer()
 model = train.ESM2Small(vocab_size=31, max_len=512)
-ckpt = torch.load("checkpoint_final.pt", map_location="cpu")
+ckpt = torch.load("weights/model.pt", map_location="cpu")
 model.load_state_dict(ckpt["model_state_dict"])
 model.eval()
 
@@ -40,31 +54,35 @@ with torch.no_grad():
     print(tokenizer.decode(logits[0].argmax(dim=-1).tolist()))
 ```
 
-## Results
+## Zero-Shot Mutation Fitness
 
-Training progress (Step 1100, epoch 1 of 5):
-- Loss: 0.45 | PPL: 1.6 | LR: 1e-4 | Speed: ~28K tokens/s
-- Epoch 1/5 checkpoint saved after training completes (~1.8h/epoch)
+Evaluated on GFP fluorescence mutations (4 test cases, CPU inference):
 
-Mutation fitness evaluation (Spearman ρ on test set):
-- Tracks masked LM logit differences between WT and mutant
+| Mutation | Type | WT score | Mut score | Δ |
+|---|---|---|---|---|
+| K7V | neutral | 1.39 | 1.52 | +0.13 |
+| K7I | neutral | 1.39 | 0.40 | -0.99 |
+| G66Y | brighter | 1.70 | 0.33 | -1.37 |
+| G66H | dimer | 1.70 | 0.32 | -1.38 |
+
+Spearman ρ = **0.200** (zero-shot, no fine-tuning)
 
 ## Files
 
 ```
-train.py          # Full training script
-download_data.py  # Swiss-Prot data downloader
-requirements.txt  # Python dependencies
-data/             # Swiss-Prot FASTA (download via script)
-output/           # Checkpoints (after training):
-                    checkpoint_epoch*.pt     # per-epoch ckpts
-                    checkpoint_step*.pt      # intermediate ckpts
-                    checkpoint_final.pt      # final model
-                    checkpoint_final_best.pt # best val loss model
-                    config.json              # training config
+weights/
+  model.pt          # Final best checkpoint (110MB)
+  config.json       # Training config
+train.py            # Full training script
+download_data.py    # Swiss-Prot data downloader
+requirements.txt    # Python dependencies
+start_training.sh   # Training launcher
+training.log        # Full training log
+fitness_results.txt # Mutation prediction results
+data/               # Swiss-Prot FASTA (download via script)
 ```
 
-## Training from scratch
+## Training from Scratch
 
 ```bash
 # 1. Download training data
