@@ -1,0 +1,19 @@
+{
+  "model_size": "150M",
+  "n_layers": 30,
+  "d_model": 640,
+  "n_heads": 20,
+  "ffn_dim": 2560,
+  "n_params": 147651200,
+  "vocab_size": 33,
+  "max_len": 512,
+  "batch_size": 8,
+  "grad_accum": 4,
+  "lr": 3e-5,
+  "weight_decay": 0.01,
+  "epochs": 5,
+  "warmup_steps": 4000,
+  "dropout": 0.1,
+  "ema_decay": 0.999,
+  "notes": "150M config. Recommended: batch_size=8 + grad_accum=4 (effective=32). Requires A100 or multi-card MLU."
+}
