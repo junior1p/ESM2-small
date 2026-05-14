@@ -1,605 +1,981 @@
 """
-Protein Language Model Training on MLU
-Architecture: ESM-2 style, ~9.6M parameters
-- 12 layers, d_model=256, nhead=8
-- Masked Language Modeling (MLM) objective
-Features: AMP-free (MLU370 float32), WandB,断点续训, best ckpt, eval
+train.py
+========
+ESM-2 style protein language model training.
+Supports CUDA (BF16 AMP), Cambricon MLU370 (FP32), and CPU.
 """
 
+from __future__ import annotations
+
+import argparse
+import copy
+import math
 import os
 import sys
-import math
 import time
-import random
-import json
-import shutil
-from pathlib import Path
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from torch.cuda.amp import GradScaler
 
-# ===== MLU Setup =====
-os.environ['LD_LIBRARY_PATH'] = '/usr/local/neuware/lib64:' + os.environ.get('LD_LIBRARY_PATH', '')
-os.environ['LD_PRELOAD'] = '/usr/local/neuware/lib64/libcnrt.so'
+# ---------------------------------------------------------------------------
+# MLU support (optional)
+# ---------------------------------------------------------------------------
+try:
+    import torch_mlu  # noqa: F401
+    _MLU_AVAILABLE = hasattr(torch, "mlu") and torch.mlu.is_available()
+except ImportError:
+    _MLU_AVAILABLE = False
 
-DEVICE = 'mlu'
+# ---------------------------------------------------------------------------
+# wandb support (optional)
+# ---------------------------------------------------------------------------
+try:
+    import wandb as _wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
 
-# ===== Tokenizer =====
-class ProteinTokenizer:
-    """Amino acid level tokenizer — 31 tokens (20 AA + 5 rare + 6 special)"""
-    AA = "ACDEFGHIKLMNPQRSTVWY"
-    RARE = "XOUBZ"
-    SPECIAL = ["<MSA>", "<gap>", "<mask>", "<unk>", "<pad>", "<eos>"]
-
-    def __init__(self):
-        self.tok_to_id = {}
-        self.id_to_tok = {}
-        for i, aa in enumerate(self.AA):
-            self.tok_to_id[aa] = i
-            self.id_to_tok[i] = aa
-        offset = len(self.AA)
-        for i, r in enumerate(self.RARE):
-            self.tok_to_id[r] = offset + i
-            self.id_to_tok[offset + i] = r
-        for i, s in enumerate(self.SPECIAL):
-            self.tok_to_id[s] = offset + len(self.RARE) + i
-            self.id_to_tok[offset + len(self.RARE) + i] = s
-        self.vocab_size = len(self.tok_to_id)  # 31
-        self.mask_tok = self.tok_to_id["<mask>"]
-        self.unk_tok = self.tok_to_id["<unk>"]
-        self.pad_tok = self.tok_to_id["<pad>"]
-        self.eos_tok = self.tok_to_id["<eos>"]
-        self.aa_set = set(self.AA)
-
-    def encode(self, seq):
-        return [self.tok_to_id.get(aa, self.unk_tok) for aa in seq.upper()]
-
-    def decode(self, ids):
-        return ''.join(self.id_to_tok.get(i, '<unk>') for i in ids)
+# ---------------------------------------------------------------------------
+# Local imports
+# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tokenizer import ESMTokenizer
+from model import build_model
+from data import ProteinDataset, collate_fn, build_dataloaders
 
 
-# ===== Dataset =====
-class ProteinDataset(Dataset):
-    def __init__(self, fasta_path, tokenizer, max_len=512, min_len=50):
-        print(f"Loading sequences from {fasta_path}...")
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-        self.min_len = min_len
-        self.sequences = self._load_fasta(fasta_path)
-        print(f"Loaded {len(self.sequences)} sequences (len {min_len}-{max_len})")
+# ===========================================================================
+# Device detection
+# ===========================================================================
 
-    def _load_fasta(self, path):
-        seqs = []
-        current_seq = []
-        with open(path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith('>'):
-                    if current_seq:
-                        seq_str = ''.join(current_seq)
-                        if self.min_len <= len(seq_str) <= self.max_len:
-                            valid = sum(1 for c in seq_str if c in self.tokenizer.aa_set)
-                            if valid / len(seq_str) >= 0.8:
-                                seqs.append(seq_str)
-                    current_seq = []
-                else:
-                    current_seq.append(line)
-            if current_seq:
-                seq_str = ''.join(current_seq)
-                if self.min_len <= len(seq_str) <= self.max_len:
-                    valid = sum(1 for c in seq_str if c in self.tokenizer.aa_set)
-                    if valid / len(seq_str) >= 0.8:
-                        seqs.append(seq_str)
-        return seqs
+def auto_detect_device(requested: str = "auto") -> torch.device:
+    """Detect the best available compute device.
 
-    def __len__(self):
-        return len(self.sequences)
+    Priority: cuda > mlu > cpu
 
-    def __getitem__(self, idx):
-        seq = self.sequences[idx]
-        tokens = self.tokenizer.encode(seq)
+    Parameters
+    ----------
+    requested : str, optional
+        One of "auto", "cuda", "mlu", "cpu" (default: "auto").
 
-        if len(tokens) > self.max_len:
-            start = random.randint(0, len(tokens) - self.max_len)
-            tokens = tokens[start:start + self.max_len]
-
-        labels = torch.tensor(tokens, dtype=torch.long)
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        mask_prob = torch.rand(len(tokens))
-        masked_tokens = tokens.clone()
-        is_masked = mask_prob < 0.15
-        masked_tokens[is_masked] = self.tokenizer.mask_tok
-
-        pad_len = self.max_len - len(tokens)
-        if pad_len > 0:
-            masked_tokens = torch.cat([masked_tokens, torch.full((pad_len,), self.tokenizer.pad_tok)])
-            labels = torch.cat([labels, torch.full((pad_len,), -100)])
-            is_masked = torch.cat([is_masked, torch.zeros(pad_len, dtype=torch.bool)])
-
-        return masked_tokens, labels, is_masked
-
-
-# ===== Model =====
-class ESM2Small(nn.Module):
+    Returns
+    -------
+    torch.device
     """
-    ESM-2 style model, ~9.6M params:
-    - 12 TransformerEncoder layers, d_model=256, nhead=8
-    - FFN dim=1024, Pre-norm, GELU, dropout=0.1
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if _MLU_AVAILABLE:
+            return torch.device("mlu")
+        return torch.device("cpu")
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but not available.")
+        return torch.device("cuda")
+    if requested == "mlu":
+        if not _MLU_AVAILABLE:
+            raise RuntimeError("MLU requested but not available.")
+        return torch.device("mlu")
+    return torch.device("cpu")
+
+
+# ===========================================================================
+# AMP context
+# ===========================================================================
+
+def get_amp_context(device: torch.device):
+    """Return AMP configuration for the given device.
+
+    Parameters
+    ----------
+    device : torch.device
+
+    Returns
+    -------
+    Tuple[bool, Optional[torch.dtype], Optional[GradScaler]]
+        (use_amp, amp_dtype, scaler)
+        - CUDA: use_amp=True, dtype=torch.bfloat16, scaler=GradScaler()
+        - MLU/CPU: use_amp=False, dtype=None, scaler=None
     """
-    def __init__(self, vocab_size=31, max_len=512):
-        super().__init__()
-        d_model = 256
-        nhead = 8
-        nlayer = 12
-        ffn_dim = 1024
-
-        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=0)
-        self.pos_embed = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
-        self.layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=d_model, nhead=nhead, dim_feedforward=ffn_dim,
-                dropout=0.1, activation='gelu', batch_first=True, norm_first=True
-            )
-            for _ in range(nlayer)
-        ])
-        self.norm = nn.LayerNorm(d_model)
-        self.proj = nn.Linear(d_model, vocab_size)
-        self._init_weights()
-
-    def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
-
-    def forward(self, tokens, mask=None):
-        B, L = tokens.shape
-        x = self.embed(tokens) + self.pos_embed[:, :L, :]
-        for layer in self.layers:
-            x = layer(x, src_key_padding_mask=mask)
-        x = self.norm(x)
-        return self.proj(x)
+    if device.type == "cuda":
+        return True, torch.bfloat16, GradScaler()
+    return False, None, None
 
 
-# ===== WandB Setup (lazy) =====
-def setup_wandb(config, args):
-    try:
-        import wandb
-        wandb_key = os.environ.get('WANDB_API_KEY', '')
-        if wandb_key:
-            wandb.login(key=wandb_key)
-            run = wandb.init(
-                project=args.wandb_project or 'protein-plm',
-                name=args.wandb_name or f'ESM2-small-{int(time.time())}',
-                config=config,
-                resume='allow',
-            )
-            return run
-        else:
-            print("WandB: no API key found, skipping")
-            return None
-    except ImportError:
-        print("WandB: not installed, skipping")
-        return None
+# ===========================================================================
+# EMA
+# ===========================================================================
+
+class EMA:
+    """Exponential Moving Average of model weights.
+
+    Parameters
+    ----------
+    model : nn.Module
+        The model whose weights to track.
+    decay : float, optional
+        EMA decay factor (default: 0.999).
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        self.shadow: dict = {}
+        self._backup: dict = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone().float()
+
+    def update(self, model: nn.Module) -> None:
+        """Update EMA weights from the current model parameters."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name] = (
+                    self.decay * self.shadow[name]
+                    + (1.0 - self.decay) * param.data.float()
+                )
+
+    def apply_shadow(self, model: nn.Module) -> None:
+        """Copy EMA weights into model (for eval/save)."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self._backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name].to(param.data.dtype))
+
+    def restore(self, model: nn.Module) -> None:
+        """Restore original weights after apply_shadow."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self._backup:
+                param.data.copy_(self._backup[name])
+        self._backup.clear()
+
+    def state_dict(self) -> dict:
+        return {"shadow": self.shadow, "decay": self.decay}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.shadow = state["shadow"]
+        self.decay = state["decay"]
 
 
-# ===== Training =====
-def train_epoch(model, loader, optimizer, scheduler, device, epoch, wandb_run, log_every=100):
+# ===========================================================================
+# Scheduler
+# ===========================================================================
+
+def get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float = 0.1,
+) -> LambdaLR:
+    """Cosine LR schedule with linear warmup."""
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < num_warmup_steps:
+            return float(current_step) / max(1, num_warmup_steps)
+        progress = float(current_step - num_warmup_steps) / max(
+            1, num_training_steps - num_warmup_steps
+        )
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return max(min_lr_ratio, cosine_decay)
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
+# ===========================================================================
+# Training epoch
+# ===========================================================================
+
+def train_epoch(
+    model: nn.Module,
+    loader,
+    optimizer,
+    scheduler,
+    device: torch.device,
+    epoch: int,
+    global_step: int,
+    wandb_run,
+    use_amp: bool,
+    amp_dtype,
+    scaler: Optional[GradScaler],
+    grad_accum: int = 1,
+    ema: Optional[EMA] = None,
+    log_every: int = 100,
+) -> Tuple[float, int]:
+    """Run one training epoch.
+
+    Parameters
+    ----------
+    model : nn.Module
+    loader : DataLoader
+    optimizer : Optimizer
+    scheduler : LRScheduler
+    device : torch.device
+    epoch : int
+    global_step : int
+    wandb_run : wandb run or None
+    use_amp : bool
+    amp_dtype : torch.dtype or None
+    scaler : GradScaler or None
+    grad_accum : int
+    ema : EMA or None
+    log_every : int
+
+    Returns
+    -------
+    Tuple[float, int]
+        (avg_loss, global_step)
+    """
     model.train()
     total_loss = 0.0
-    total_masked = 0
-    t0 = time.time()
+    total_tokens = 0
+    optimizer.zero_grad()
 
-    for step, (tokens, labels, is_masked) in enumerate(loader):
-        tokens = tokens.to(device)
-        labels = labels.to(device)
-        mask = (tokens == 0)  # padding mask
+    num_batches = len(loader)
+    epoch_start = time.time()
+    step_start = time.time()
 
-        logits = model(tokens)
-        loss = nn.CrossEntropyLoss(ignore_index=-100)(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1)
-        )
+    for batch_idx, batch in enumerate(loader):
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
+        # Count valid (non-ignored) label tokens for throughput
+        n_tokens = (labels != -100).sum().item()
 
-        n_masked = is_masked.sum().item()
-        total_loss += loss.item() * n_masked
-        total_masked += n_masked
+        # Forward pass with optional AMP
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype if amp_dtype is not None else torch.float32,
+            enabled=use_amp,
+        ):
+            logits = model(input_ids)  # (B, L, vocab_size)
+            # Flatten for cross-entropy
+            loss = nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-100,
+            )
+            # Scale loss for gradient accumulation
+            loss_scaled = loss / grad_accum
 
-        if (step + 1) % log_every == 0:
-            elapsed = time.time() - t0
-            lr = scheduler.get_last_lr()[0]
-            avg_loss = total_loss / total_masked
-            ppl = math.exp(min(avg_loss, 10))
-            throughput = log_every * tokens.size(0) * tokens.size(1) / elapsed / 1000
-            eta = (len(loader) - step - 1) * elapsed / log_every / 3600
+        # Backward
+        if use_amp and scaler is not None:
+            scaler.scale(loss_scaled).backward()
+        else:
+            loss_scaled.backward()
 
-            log_str = (f"  Step {step+1:4d} | loss={avg_loss:.4f} | ppl={ppl:.1f} | "
-                       f"lr={lr:.2e} | throughput={throughput:.0f}K tok/s | eta={eta:.1f}h")
-            print(log_str)
+        total_loss += loss.item()
+        total_tokens += n_tokens
 
-            if wandb_run:
-                wandb_run.log({
-                    'train/loss': avg_loss,
-                    'train/ppl': ppl,
-                    'train/lr': lr,
-                    'train/throughput': throughput,
-                    'epoch': epoch + 1,
-                    'step': epoch * len(loader) + step + 1,
-                })
+        # Optimizer step every grad_accum micro-steps
+        if (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) == num_batches:
+            if use_amp and scaler is not None:
+                scaler.unscale_(optimizer)
+                clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
-            total_loss = 0.0
-            total_masked = 0
-            t0 = time.time()
+            scheduler.step()
+            optimizer.zero_grad()
+            global_step += 1
 
-    avg_loss = total_loss / max(total_masked, 1)
-    return avg_loss, math.exp(min(avg_loss, 10))
+            # EMA update
+            if ema is not None:
+                ema.update(model)
+
+            # Logging
+            if global_step % log_every == 0:
+                elapsed = time.time() - step_start
+                avg_loss_so_far = total_loss / (batch_idx + 1)
+                ppl = math.exp(min(avg_loss_so_far, 20))
+                lr = scheduler.get_last_lr()[0]
+                throughput = total_tokens / max(elapsed, 1e-6)
+                batches_remaining = num_batches - batch_idx - 1
+                eta_sec = batches_remaining * (elapsed / max(batch_idx + 1, 1))
+
+                print(
+                    f"Epoch {epoch:3d} | Step {global_step:7d} | "
+                    f"loss {avg_loss_so_far:.4f} | ppl {ppl:.2f} | "
+                    f"lr {lr:.2e} | "
+                    f"thr {throughput:.0f} tok/s | "
+                    f"eta {eta_sec/60:.1f}m"
+                )
+
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "train/loss": avg_loss_so_far,
+                            "train/ppl": ppl,
+                            "train/lr": lr,
+                            "train/throughput": throughput,
+                            "global_step": global_step,
+                        }
+                    )
+
+                step_start = time.time()
+                total_tokens = 0
+
+    avg_loss = total_loss / max(num_batches, 1)
+    return avg_loss, global_step
 
 
-def evaluate(model, loader, device, epoch=0, wandb_run=None):
+# ===========================================================================
+# Evaluation
+# ===========================================================================
+
+def evaluate(
+    model: nn.Module,
+    loader,
+    device: torch.device,
+    use_amp: bool,
+    amp_dtype,
+    epoch: int = 0,
+    wandb_run=None,
+) -> Tuple[float, float]:
+    """Evaluate the model on a validation DataLoader.
+
+    Parameters
+    ----------
+    model : nn.Module
+    loader : DataLoader
+    device : torch.device
+    use_amp : bool
+    amp_dtype : torch.dtype or None
+    epoch : int
+    wandb_run : wandb run or None
+
+    Returns
+    -------
+    Tuple[float, float]
+        (avg_loss, perplexity)
+    """
     model.eval()
     total_loss = 0.0
-    total_tokens = 0
+    num_batches = 0
 
     with torch.no_grad():
-        for tokens, labels, is_masked in loader:
-            tokens = tokens.to(device)
-            labels = labels.to(device)
-            logits = model(tokens)
-            loss = nn.CrossEntropyLoss(ignore_index=-100)(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1)
-            )
-            valid = (labels != -100).sum().item()
-            total_loss += loss.item() * valid
-            total_tokens += valid
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
 
-    avg_loss = total_loss / max(total_tokens, 1)
-    ppl = math.exp(min(avg_loss, 10))
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype if amp_dtype is not None else torch.float32,
+                enabled=use_amp,
+            ):
+                logits = model(input_ids)
+                loss = nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    ignore_index=-100,
+                )
 
-    log_str = f"  Val | loss={avg_loss:.4f} | ppl={ppl:.1f}"
-    print(log_str)
+            total_loss += loss.item()
+            num_batches += 1
 
-    if wandb_run:
-        wandb_run.log({
-            'val/loss': avg_loss,
-            'val/ppl': ppl,
-            'epoch': epoch + 1,
-        })
+    avg_loss = total_loss / max(num_batches, 1)
+    perplexity = math.exp(min(avg_loss, 20))
 
-    return avg_loss, ppl
+    print(f"  [Eval] epoch={epoch} | loss={avg_loss:.4f} | ppl={perplexity:.2f}")
+
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                "val/loss": avg_loss,
+                "val/ppl": perplexity,
+                "epoch": epoch,
+            }
+        )
+
+    return avg_loss, perplexity
 
 
-# ===== Fitness Evaluation (mutation prediction) =====
-def evaluate_fitness(model, tokenizer, device, wandb_run=None):
+# ===========================================================================
+# Checkpoint helpers
+# ===========================================================================
+
+def save_checkpoint(
+    path: str,
+    epoch: int,
+    global_step: int,
+    model: nn.Module,
+    optimizer,
+    scheduler,
+    ema: Optional[EMA],
+    val_loss: float,
+    config: dict,
+    model_size: str,
+    device: torch.device,
+) -> None:
+    """Save a training checkpoint.
+
+    Parameters
+    ----------
+    path : str
+        File path to save the checkpoint.
+    epoch : int
+    global_step : int
+    model : nn.Module
+    optimizer : Optimizer
+    scheduler : LRScheduler
+    ema : EMA or None
+    val_loss : float
+    config : dict
+    model_size : str
+    device : torch.device
     """
-    Evaluate on a small set of log-odds mutation effects.
-    Uses masked token prediction to score mutations.
-    Runs on CPU to avoid MLU triton inference kernel issues.
+    rng_state = {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state() if device.type == "cuda" else None,
+    }
+
+    checkpoint = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "ema_state_dict": ema.state_dict() if ema is not None else None,
+        "val_loss": val_loss,
+        "config": config,
+        "model_size": model_size,
+        "rng_state": rng_state,
+    }
+
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    torch.save(checkpoint, path)
+    print(f"  [Checkpoint] Saved to {path}")
+
+
+def load_checkpoint(
+    path: str,
+    model: nn.Module,
+    optimizer=None,
+    scheduler=None,
+    ema: Optional[EMA] = None,
+    device: torch.device = torch.device("cpu"),
+) -> dict:
+    """Load a training checkpoint.
+
+    Parameters
+    ----------
+    path : str
+        Path to the checkpoint file.
+    model : nn.Module
+    optimizer : Optimizer or None
+    scheduler : LRScheduler or None
+    ema : EMA or None
+    device : torch.device
+
+    Returns
+    -------
+    dict
+        The full checkpoint dictionary.
     """
-    import copy
-    model_cpu = copy.deepcopy(model).cpu()
-    model_cpu.eval()
+    checkpoint = torch.load(path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
 
-    # Human HbS (sickle cell) - common variant benchmarks
-    # Format: (wt_seq, pos, mut_aa, expected_effect)
-    benchmarks = [
-        # Thermostability & fluorescence benchmarks
-        ("MVLSPADKTNVKAAWGKVGAHAGEYGAEALERMFLSFPTTKTYFPHFDLSH", 7, "V", "neutral"),
-        ("MVLSPADKTNVKAAWGKVGAHAGEYGAEALERMFLSFPTTKTYFPHFDLSH", 7, "I", "neutral"),
-        ("MVLSPADKTNVKAAWGKVGAHAGEYGAEALERMFLSFPTTKTYFPHFDLSH", 80, "L", "neutral"),
-        # GFP chromophore mutants (representative)
-        ("VSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTLVTTFSYGVQC", 66, "Y", "brighter"),
-        ("VSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTLVTTFSYGVQC", 66, "H", "dimer"),
-    ]
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if scheduler is not None and "scheduler_state_dict" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    if ema is not None and checkpoint.get("ema_state_dict") is not None:
+        ema.load_state_dict(checkpoint["ema_state_dict"])
 
-    print("\n=== Fitness Evaluation (CPU inference) ===")
+    # Restore RNG state
+    rng = checkpoint.get("rng_state", {})
+    if rng.get("torch") is not None:
+        torch.set_rng_state(rng["torch"])
+    if rng.get("cuda") is not None and device.type == "cuda":
+        torch.cuda.set_rng_state(rng["cuda"])
+
+    print(
+        f"  [Checkpoint] Loaded from {path} "
+        f"(epoch={checkpoint.get('epoch', '?')}, "
+        f"step={checkpoint.get('global_step', '?')})"
+    )
+    return checkpoint
+
+
+# ===========================================================================
+# Built-in GFP fitness evaluation
+# ===========================================================================
+
+# avGFP WT sequence (first 100 aa for fast evaluation)
+_GFP_WT_SEQ = (
+    "MSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTLVTTLTYGVQ"
+    "CFSRYPDHMKQHDFFKSAMPEGYVQERTIFFKDDG"
+)
+
+_GFP_MUTATIONS = [
+    {"pos": 64, "wt": "S", "mut": "T", "effect": "brighter"},   # S65T (0-indexed: 64)
+    {"pos": 63, "wt": "F", "mut": "L", "effect": "neutral"},    # F64L (0-indexed: 63)
+    {"pos": 65, "wt": "Y", "mut": "W", "effect": "brighter"},   # Y66W (0-indexed: 65)
+    {"pos": 65, "wt": "Y", "mut": "C", "effect": "deleterious"},# Y66C (0-indexed: 65)
+]
+
+
+def evaluate_fitness_builtin(
+    model: nn.Module,
+    tokenizer: ESMTokenizer,
+    device: torch.device,
+) -> None:
+    """Evaluate model fitness using masked logit-diff on avGFP mutations.
+
+    Uses per-position masked logit-diff: mask the mutation site, compute
+    log P(mut) - log P(wt) from the model's output logits.
+
+    Parameters
+    ----------
+    model : nn.Module
+    tokenizer : ESMTokenizer
+    device : torch.device
+    """
+    print("\n[GFP Fitness Evaluation]")
+    print(f"  WT sequence (first 100aa): {_GFP_WT_SEQ[:30]}...")
+
+    model.eval()
+    wt_seq = _GFP_WT_SEQ
+
     results = []
-    for wt_seq, pos, mut_aa, effect in benchmarks:
-        if pos >= len(wt_seq):
-            continue
-        wt_aa = wt_seq[pos]
-        if wt_aa == mut_aa:
-            continue
+    with torch.no_grad():
+        for mut_info in _GFP_MUTATIONS:
+            pos = mut_info["pos"]       # 0-indexed in sequence
+            wt_aa = mut_info["wt"]
+            mut_aa = mut_info["mut"]
+            effect = mut_info["effect"]
 
-        wt_ids = tokenizer.encode(wt_seq)
-        wt_ids[pos] = tokenizer.mask_tok
-        wt_tensor = torch.tensor([wt_ids], dtype=torch.long)
-        with torch.no_grad():
-            logits = model_cpu(wt_tensor)
-            mask_logit = logits[0, pos, :]
-            wt_aa_id = tokenizer.tok_to_id.get(wt_aa, -1)
-            mut_aa_id = tokenizer.tok_to_id.get(mut_aa, -1)
-            if wt_aa_id < 0 or mut_aa_id < 0:
+            # Verify WT residue
+            if wt_seq[pos] != wt_aa:
+                print(
+                    f"  WARNING: Expected {wt_aa} at pos {pos}, "
+                    f"got {wt_seq[pos]}. Skipping."
+                )
                 continue
-            wt_score = mask_logit[wt_aa_id].item()
-            mut_score = mask_logit[mut_aa_id].item()
-            delta = mut_score - wt_score
 
-        results.append({
-            'wt_aa': wt_aa, 'pos': pos, 'mut_aa': mut_aa,
-            'effect': effect,
-            'wt_score': wt_score, 'mut_score': mut_score,
-            'delta': delta
-        })
-        print(f"  {wt_aa}{pos}{mut_aa} ({effect:10s}) | WT={wt_score:.2f} | Mut={mut_score:.2f} | Δ={delta:.2f}")
+            # Build masked sequence: replace pos with <mask>
+            masked_seq = wt_seq[:pos] + "<mask>" + wt_seq[pos + 1:]
 
-    if len(results) >= 3:
-        effect_map = {'brighter': 1, 'neutral': 0, 'dimer': -1, 'deleterious': -2}
-        pred_scores = [r['delta'] for r in results]
-        true_scores = [effect_map.get(r['effect'], 0) for r in results]
-        spearman = compute_spearman(pred_scores, true_scores)
-        print(f"  Spearman ρ: {spearman:.3f}")
-        if wandb_run:
-            wandb_run.log({'fitness/spearman': spearman})
+            # Tokenize: encode WT but replace the residue position with mask token
+            # token position = pos + 1 (offset by <cls>)
+            token_ids = tokenizer.encode(wt_seq)
+            token_pos = pos + 1  # +1 for <cls>
 
-    del model_cpu
-    return results
+            masked_ids = list(token_ids)
+            masked_ids[token_pos] = tokenizer.mask_token_id
 
+            input_tensor = torch.tensor([masked_ids], dtype=torch.long).to(device)
 
-def compute_spearman(pred, true):
-    n = len(pred)
-    if n < 2:
-        return 0.0
-    # Simple rank correlation
-    def rank(x):
-        return sorted(range(len(x)), key=lambda i: x[i])
-    pred_ranks = [sorted(range(n), key=lambda i: pred[i])[i] for i in range(n)]
-    true_ranks = [sorted(range(n), key=lambda i: true[i])[i] for i in range(n)]
-    mean_p = sum(pred_ranks) / n
-    mean_t = sum(true_ranks) / n
-    num = sum((pred_ranks[i] - mean_p) * (true_ranks[i] - mean_t) for i in range(n))
-    den = math.sqrt(sum((p - mean_p)**2 for p in pred_ranks) * sum((t - mean_t)**2 for t in true_ranks))
-    return num / den if den > 0 else 0.0
+            logits = model(input_tensor)  # (1, L, vocab_size)
+            log_probs = torch.log_softmax(logits[0, token_pos], dim=-1)
 
+            wt_id = tokenizer.encode(wt_aa)[1]   # skip <cls>
+            mut_id = tokenizer.encode(mut_aa)[1]  # skip <cls>
 
-# ===== Checkpoint =====
-def save_checkpoint(model, optimizer, scheduler, epoch, global_step,
-                    val_loss, config, path, is_best=False):
-    torch.save({
-        'epoch': epoch,
-        'global_step': global_step,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'val_loss': val_loss,
-        'config': config,
-    }, path)
-    print(f"  ✓ Saved: {path}")
-    if is_best:
-        best_path = path.replace('.pt', '_best.pt')
-        shutil.copy2(path, best_path)
-        print(f"  ✓ Best: {best_path}")
+            score = (log_probs[mut_id] - log_probs[wt_id]).item()
+            results.append(
+                {
+                    "mutation": f"{wt_aa}{pos + 1}{mut_aa}",
+                    "score": score,
+                    "effect": effect,
+                }
+            )
+            print(
+                f"  {wt_aa}{pos + 1}{mut_aa:3s} | score={score:+.4f} | "
+                f"expected={effect}"
+            )
+
+    # Summary
+    if results:
+        brighter = [r["score"] for r in results if r["effect"] == "brighter"]
+        deleterious = [r["score"] for r in results if r["effect"] == "deleterious"]
+        neutral = [r["score"] for r in results if r["effect"] == "neutral"]
+
+        print("\n  Summary:")
+        if brighter:
+            print(f"    Brighter mutations avg score:    {sum(brighter)/len(brighter):+.4f}")
+        if neutral:
+            print(f"    Neutral mutations avg score:     {sum(neutral)/len(neutral):+.4f}")
+        if deleterious:
+            print(f"    Deleterious mutations avg score: {sum(deleterious)/len(deleterious):+.4f}")
+
+        # Sanity check: brighter > deleterious?
+        if brighter and deleterious:
+            ok = sum(brighter) / len(brighter) > sum(deleterious) / len(deleterious)
+            print(f"    Rank order correct (brighter > deleterious): {ok}")
 
 
-def load_checkpoint(path, model, optimizer, scheduler):
-    print(f"  Resuming from: {path}")
-    ckpt = torch.load(path, map_location='cpu')
-    model.load_state_dict(ckpt['model_state_dict'])
-    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-    epoch = ckpt['epoch']
-    global_step = ckpt['global_step']
-    val_loss = ckpt.get('val_loss', float('inf'))
-    print(f"  Resumed: epoch={epoch}, global_step={global_step}, val_loss={val_loss:.4f}")
-    return epoch, global_step, val_loss
+# ===========================================================================
+# Main
+# ===========================================================================
 
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="ESM-2 style protein language model training."
+    )
 
-# ===== Main =====
-def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, default='/root/protein_plm/data/swissprot.fasta')
-    parser.add_argument('--max_len', type=int, default=512)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=5)
-    parser.add_argument('--warmup_steps', type=int, default=1000)
-    parser.add_argument('--save_every', type=int, default=5000)
-    parser.add_argument('--eval_every', type=int, default=2000)
-    parser.add_argument('--out_dir', type=str, default='/root/protein_plm/output')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint.pt to resume from')
-    parser.add_argument('--wandb_project', type=str, default='protein-plm-mlu')
-    parser.add_argument('--wandb_name', type=str, default=None)
-    parser.add_argument('--seed', type=int, default=42)
-    args = parser.parse_args()
-
-    os.makedirs(args.out_dir, exist_ok=True)
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-
-    device = torch.device(DEVICE)
-    print(f"Device: {device}")
-    print(f"Config: epochs={args.epochs}, batch_size={args.batch_size}, "
-          f"max_len={args.max_len}, lr={args.lr}")
-
-    # Tokenizer
-    tokenizer = ProteinTokenizer()
-    vocab_size = tokenizer.vocab_size
-    print(f"Tokenizer vocab size: {vocab_size}")
-
-    # Dataset
-    full_ds = ProteinDataset(args.data, tokenizer, max_len=args.max_len, min_len=50)
-    n_train = int(len(full_ds) * 0.95)
-    n_val = len(full_ds) - n_train
-    train_ds, val_ds = torch.utils.data.random_split(full_ds, [n_train, n_val])
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=4, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size * 2, shuffle=False,
-                              num_workers=4, pin_memory=True)
-
-    print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
+    # Data
+    parser.add_argument("--train_data", type=str, required=True,
+                        help="Path to training FASTA file.")
+    parser.add_argument("--val_data", type=str, required=True,
+                        help="Path to validation FASTA file.")
 
     # Model
-    model = ESM2Small(vocab_size=vocab_size, max_len=args.max_len).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params/1e6:.1f}M")
+    parser.add_argument("--model_size", type=str, default="8M",
+                        choices=["8M", "35M", "150M"],
+                        help="Model size configuration (default: 8M).")
+    parser.add_argument("--max_len", type=int, default=512,
+                        help="Maximum sequence length including cls/eos (default: 512).")
 
-    config = {
-        'n_params': n_params,
-        'vocab_size': vocab_size,
-        'max_len': args.max_len,
-        'batch_size': args.batch_size,
-        'lr': args.lr,
-        'epochs': args.epochs,
-        'warmup_steps': args.warmup_steps,
-        'n_train': n_train,
-        'n_val': n_val,
-    }
-    with open(os.path.join(args.out_dir, 'config.json'), 'w') as f:
-        json.dump(config, f, indent=2)
+    # Training
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Per-device batch size (default: 32).")
+    parser.add_argument("--grad_accum", type=int, default=1,
+                        help="Gradient accumulation steps (default: 1).")
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="Peak learning rate (default: 1e-4).")
+    parser.add_argument("--weight_decay", type=float, default=0.01,
+                        help="AdamW weight decay (default: 0.01).")
+    parser.add_argument("--epochs", type=int, default=5,
+                        help="Number of training epochs (default: 5).")
+    parser.add_argument("--warmup_steps", type=int, default=1000,
+                        help="LR warmup steps (default: 1000).")
 
-    # Optimizer
-    no_decay = ['bias', 'norm']
-    param_groups = [
-        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-         'weight_decay': 0.01},
-        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-         'weight_decay': 0.0}
-    ]
-    optimizer = AdamW(param_groups, lr=args.lr, betas=(0.9, 0.999))
+    # Checkpointing / evaluation
+    parser.add_argument("--save_every", type=int, default=5000,
+                        help="Save checkpoint every N steps (default: 5000).")
+    parser.add_argument("--eval_every", type=int, default=2000,
+                        help="Evaluate every N steps mid-epoch (default: 2000).")
+    parser.add_argument("--out_dir", type=str, default="output",
+                        help="Output directory for checkpoints (default: output).")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from (default: None).")
 
-    total_steps = len(train_loader) * args.epochs
-    warmup_steps = args.warmup_steps
+    # Device / precision
+    parser.add_argument("--device", type=str, default="auto",
+                        help="Device: auto, cuda, mlu, cpu (default: auto).")
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / warmup_steps
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        return 0.5 * (1 + math.cos(math.pi * progress))
+    # EMA
+    parser.add_argument("--ema_decay", type=float, default=0.0,
+                        help="EMA decay (0 = disabled, default: 0.0).")
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # Logging
+    parser.add_argument("--wandb_project", type=str, default="protein-plm",
+                        help="W&B project name (default: protein-plm).")
+    parser.add_argument("--wandb_name", type=str, default=None,
+                        help="W&B run name (default: None).")
 
+    # Reproducibility
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed (default: 42).")
+
+    args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Seed
+    # ------------------------------------------------------------------
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    # ------------------------------------------------------------------
+    # Device & AMP
+    # ------------------------------------------------------------------
+    device = auto_detect_device(args.device)
+    use_amp, amp_dtype, scaler = get_amp_context(device)
+    print(f"Device: {device} | AMP: {use_amp} | dtype: {amp_dtype}")
+
+    # ------------------------------------------------------------------
+    # Tokenizer & Model
+    # ------------------------------------------------------------------
+    tokenizer = ESMTokenizer()
+    model = build_model(model_size=args.model_size, vocab_size=tokenizer.vocab_size)
+    model = model.to(device)
+    n_params = model.count_parameters()
+    print(f"Model: ESM-2 {args.model_size} | Parameters: {n_params:,}")
+
+    # ------------------------------------------------------------------
+    # DataLoaders
+    # ------------------------------------------------------------------
+    train_loader, val_loader = build_dataloaders(
+        train_fasta=args.train_data,
+        val_fasta=args.val_data,
+        tokenizer=tokenizer,
+        batch_size=args.batch_size,
+        max_len=args.max_len,
+        num_workers=4,
+        seed=args.seed,
+    )
+    print(
+        f"Data: {len(train_loader.dataset)} train seqs, "
+        f"{len(val_loader.dataset)} val seqs"
+    )
+
+    # ------------------------------------------------------------------
+    # Optimizer & Scheduler
+    # ------------------------------------------------------------------
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+    )
+
+    total_steps = (
+        len(train_loader) // args.grad_accum * args.epochs
+    )
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=total_steps,
+    )
+
+    # ------------------------------------------------------------------
+    # EMA
+    # ------------------------------------------------------------------
+    ema: Optional[EMA] = None
+    if args.ema_decay > 0.0:
+        ema = EMA(model, decay=args.ema_decay)
+        print(f"EMA enabled with decay={args.ema_decay}")
+
+    # ------------------------------------------------------------------
+    # W&B
+    # ------------------------------------------------------------------
+    wandb_run = None
+    if _WANDB_AVAILABLE:
+        try:
+            wandb_run = _wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_name,
+                config=vars(args),
+            )
+        except Exception as e:
+            print(f"W&B init failed: {e}. Continuing without W&B.")
+
+    # ------------------------------------------------------------------
     # Resume
+    # ------------------------------------------------------------------
     start_epoch = 0
     global_step = 0
-    best_val_loss = float('inf')
-    wandb_run = None
+    best_val_loss = float("inf")
 
-    if args.resume and os.path.exists(args.resume):
-        start_epoch, global_step, best_val_loss = load_checkpoint(
-            args.resume, model, optimizer, scheduler)
-        # Recompute scheduler's step count
-        for _ in range(global_step):
-            scheduler.step()
+    if args.resume is not None:
+        ckpt = load_checkpoint(
+            args.resume, model, optimizer, scheduler, ema, device
+        )
+        start_epoch = ckpt.get("epoch", 0) + 1
+        global_step = ckpt.get("global_step", 0)
+        best_val_loss = ckpt.get("val_loss", float("inf"))
 
-    # WandB
-    wandb_run = setup_wandb(config, args)
+    # ------------------------------------------------------------------
+    # Config dict for checkpoints
+    # ------------------------------------------------------------------
+    config = vars(args)
 
+    # ------------------------------------------------------------------
     # Training loop
-    print(f"\n{'='*60}")
-    print(f"Starting training from epoch {start_epoch+1}, global_step {global_step}")
-    print(f"{'='*60}")
+    # ------------------------------------------------------------------
+    os.makedirs(args.out_dir, exist_ok=True)
 
     for epoch in range(start_epoch, args.epochs):
-        print(f"\nEpoch {epoch+1}/{args.epochs}")
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch + 1}/{args.epochs}")
+        print(f"{'='*60}")
 
-        # Evaluate at epoch start
-        val_loss, val_ppl = evaluate(model, val_loader, device, epoch, wandb_run)
-        print(f"  LR: {scheduler.get_last_lr()[0]:.2e}")
+        # Evaluate at the start of each epoch
+        val_loss, val_ppl = evaluate(
+            model, val_loader, device, use_amp, amp_dtype,
+            epoch=epoch, wandb_run=wandb_run
+        )
 
-        is_best = val_loss < best_val_loss
-        if is_best:
+        # Save best checkpoint
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
-
-        # Periodic checkpoint
-        ckpt_path = os.path.join(args.out_dir, f'checkpoint_epoch{epoch+1}.pt')
-        save_checkpoint(model, optimizer, scheduler, epoch, global_step,
-                        val_loss, config, ckpt_path, is_best=is_best)
-
-        # Train epoch
-        model.train()
-        t0 = time.time()
-        epoch_loss = 0.0
-        epoch_masked = 0
-
-        for step, (tokens, labels, is_masked) in enumerate(train_loader):
-            tokens = tokens.to(device)
-            labels = labels.to(device)
-
-            logits = model(tokens)
-            loss = nn.CrossEntropyLoss(ignore_index=-100)(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1)
+            save_checkpoint(
+                path=os.path.join(args.out_dir, "best_checkpoint.pt"),
+                epoch=epoch,
+                global_step=global_step,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                ema=ema,
+                val_loss=val_loss,
+                config=config,
+                model_size=args.model_size,
+                device=device,
             )
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
+        # Train one epoch (with mid-epoch eval and step checkpoints)
+        def _mid_epoch_hooks(step: int, model: nn.Module) -> None:
+            nonlocal best_val_loss
+            if step % args.eval_every == 0 and step > 0:
+                vl, vp = evaluate(
+                    model, val_loader, device, use_amp, amp_dtype,
+                    epoch=epoch, wandb_run=wandb_run
+                )
+                if vl < best_val_loss:
+                    best_val_loss = vl
+                    save_checkpoint(
+                        path=os.path.join(args.out_dir, "best_checkpoint.pt"),
+                        epoch=epoch,
+                        global_step=step,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        ema=ema,
+                        val_loss=vl,
+                        config=config,
+                        model_size=args.model_size,
+                        device=device,
+                    )
+            if step % args.save_every == 0 and step > 0:
+                save_checkpoint(
+                    path=os.path.join(args.out_dir, f"step_{step:08d}.pt"),
+                    epoch=epoch,
+                    global_step=step,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    ema=ema,
+                    val_loss=best_val_loss,
+                    config=config,
+                    model_size=args.model_size,
+                    device=device,
+                )
 
-            global_step += 1
-            n_masked = is_masked.sum().item()
-            epoch_loss += loss.item() * n_masked
-            epoch_masked += n_masked
+        # Custom train loop with mid-epoch hooks
+        model.train()
+        total_loss = 0.0
+        optimizer.zero_grad()
+        num_batches = len(train_loader)
+        epoch_start = time.time()
+        step_start = time.time()
+        total_tokens = 0
 
-            # Log
-            if (step + 1) % 100 == 0:
-                elapsed = time.time() - t0
-                lr = scheduler.get_last_lr()[0]
-                avg_loss = epoch_loss / max(epoch_masked, 1)
-                ppl = math.exp(min(avg_loss, 10))
-                throughput = 100 * tokens.size(0) * tokens.size(1) / elapsed / 1000
-                eta = (len(train_loader) - step - 1) * elapsed / 100 / 3600
-                print(f"  Step {step+1:4d} | loss={avg_loss:.4f} | ppl={ppl:.1f} | "
-                      f"lr={lr:.2e} | throughput={throughput:.0f}K tok/s | eta={eta:.1f}h")
-                if wandb_run:
-                    wandb_run.log({
-                        'train/loss': avg_loss,
-                        'train/ppl': ppl,
-                        'train/lr': lr,
-                        'train/throughput': throughput,
-                        'epoch': epoch + 1,
-                        'step': global_step,
-                    })
-                epoch_loss = 0.0
-                epoch_masked = 0
-                t0 = time.time()
+        for batch_idx, batch in enumerate(train_loader):
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
 
-            # Periodic eval + checkpoint
-            if global_step > 0 and global_step % args.eval_every == 0:
-                val_loss2, val_ppl2 = evaluate(model, val_loader, device, epoch, wandb_run)
-                ckpt_path = os.path.join(args.out_dir, f'checkpoint_step{global_step}.pt')
-                save_checkpoint(model, optimizer, scheduler, epoch, global_step,
-                                val_loss2, config, ckpt_path, is_best=(val_loss2 < best_val_loss))
-                if val_loss2 < best_val_loss:
-                    best_val_loss = val_loss2
-                model.train()
+            n_tokens = (labels != -100).sum().item()
 
-        # End of epoch
-        print(f"\n  Train (epoch avg) | loss={epoch_loss/max(epoch_masked,1):.4f}")
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype if amp_dtype is not None else torch.float32,
+                enabled=use_amp,
+            ):
+                logits = model(input_ids)
+                loss = nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    ignore_index=-100,
+                )
+                loss_scaled = loss / args.grad_accum
 
-        if wandb_run:
-            wandb_run.log({'epoch': epoch + 1})
+            if use_amp and scaler is not None:
+                scaler.scale(loss_scaled).backward()
+            else:
+                loss_scaled.backward()
 
-    # Final fitness eval
-    print("\n" + "="*60)
-    print("Training complete!")
-    print(f"Best val loss: {best_val_loss:.4f}")
-    print("="*60)
+            total_loss += loss.item()
+            total_tokens += n_tokens
 
-    evaluate_fitness(model, tokenizer, device, wandb_run)
+            if (batch_idx + 1) % args.grad_accum == 0 or (batch_idx + 1) == num_batches:
+                if use_amp and scaler is not None:
+                    scaler.unscale_(optimizer)
+                    clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
 
-    # Final checkpoint
-    final_path = os.path.join(args.out_dir, 'checkpoint_final.pt')
-    save_checkpoint(model, optimizer, scheduler, args.epochs - 1, global_step,
-                    best_val_loss, config, final_path, is_best=True)
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
 
-    if wandb_run:
+                if ema is not None:
+                    ema.update(model)
+
+                # Mid-epoch hooks
+                _mid_epoch_hooks(global_step, model)
+
+                if global_step % 100 == 0:
+                    elapsed = time.time() - step_start
+                    avg_loss_so_far = total_loss / (batch_idx + 1)
+                    ppl = math.exp(min(avg_loss_so_far, 20))
+                    lr = scheduler.get_last_lr()[0]
+                    throughput = total_tokens / max(elapsed, 1e-6)
+                    batches_remaining = num_batches - batch_idx - 1
+                    eta_sec = batches_remaining * (elapsed / max(batch_idx + 1, 1))
+
+                    print(
+                        f"Epoch {epoch + 1:3d} | Step {global_step:7d} | "
+                        f"loss {avg_loss_so_far:.4f} | ppl {ppl:.2f} | "
+                        f"lr {lr:.2e} | "
+                        f"thr {throughput:.0f} tok/s | "
+                        f"eta {eta_sec/60:.1f}m"
+                    )
+
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "train/loss": avg_loss_so_far,
+                                "train/ppl": ppl,
+                                "train/lr": lr,
+                                "train/throughput": throughput,
+                                "global_step": global_step,
+                            }
+                        )
+
+                    step_start = time.time()
+                    total_tokens = 0
+
+        avg_train_loss = total_loss / max(num_batches, 1)
+        print(f"  Epoch {epoch + 1} done | avg_train_loss={avg_train_loss:.4f}")
+
+        # Save epoch checkpoint
+        save_checkpoint(
+            path=os.path.join(args.out_dir, f"epoch_{epoch + 1:03d}.pt"),
+            epoch=epoch,
+            global_step=global_step,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=ema,
+            val_loss=best_val_loss,
+            config=config,
+            model_size=args.model_size,
+            device=device,
+        )
+
+    # ------------------------------------------------------------------
+    # Final evaluation
+    # ------------------------------------------------------------------
+    print("\n[Final Evaluation]")
+    val_loss, val_ppl = evaluate(
+        model, val_loader, device, use_amp, amp_dtype,
+        epoch=args.epochs, wandb_run=wandb_run
+    )
+    print(f"Final val_loss={val_loss:.4f} | ppl={val_ppl:.2f}")
+
+    # ------------------------------------------------------------------
+    # Built-in GFP fitness evaluation
+    # ------------------------------------------------------------------
+    evaluate_fitness_builtin(model, tokenizer, device)
+
+    if wandb_run is not None:
         wandb_run.finish()
 
-    print("\nDone!")
+    print("\nTraining complete.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
