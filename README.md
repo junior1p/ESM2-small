@@ -1,99 +1,149 @@
 # ESM2-small
 
-**9.6M parameter protein language model** trained on Swiss-Prot with MLU370 (Cambricon).
+ESM-2 style protein language model series trained from scratch on Swiss-Prot.
 
-Architecture mirrors [ESM-2](https://facebookresearch.github.io/esm/):
-- 12-layer Transformer Encoder
-- d_model=256, nhead=8, FFN dim=1024
-- Pre-norm, GELU activation, 15% MLM masking
+## Model Series
 
-## Training
+| Model | Layers | d_model | Heads | FFN | Params | Status |
+|-------|--------|---------|-------|-----|--------|--------|
+| ESM2-8M | 6 | 320 | 20 | 1280 | 7.4M | ✓ Trained |
+| ESM2-35M | 6 | 480 | 20 | 1920 | 16.6M | Training ready |
+| ESM2-150M | 30 | 640 | 20 | 2560 | 147.6M | Training ready |
 
-| Parameter | Value |
-|---|---|
-| Data | Swiss-Prot (456,404 train / 22,821 val) |
-| Device | MLU370 (Cambricon) — 1 card |
-| Batch | 32 × 512 tokens |
-| Speed | ~30K tokens/s |
-| Epochs | 5 (~2h/epoch, total ~10h) |
-| Optimizer | AdamW (lr=1e-4, warmup=1000 steps, cosine decay) |
-| Final val loss | **0.4170** |
+## Architecture
 
-### Training Progress
-
-| Epoch | Val Loss | Notes |
-|---|---|---|
-| 1 | 0.4195 | checkpoint ~38MB (EMA) |
-| 2 | 0.4235 | — |
-| 3 | 0.4182 | best so far |
-| 4 | 0.4185 | — |
-| 5 | 0.4179 | final epoch |
-| **Final** | **0.4170** | checkpoint_final_best.pt |
+- **Rotary Position Embeddings (RoPE)** — replaces learned PE; supports length extrapolation beyond training length
+- **Pre-norm Transformer blocks** — LayerNorm applied before attention and FFN sub-layers
+- **Weight-tied LM head** — `lm_head.weight = embed_tokens.weight`, reducing parameter count
+- **33-token vocabulary** — aligned with ESM-2 official vocab order (includes `<cls>`/`<eos>` boundary tokens)
+- **MLM objective** — 15% masking (80% `<mask>` / 10% random token / 10% unchanged)
 
 ## Quick Start
 
-```python
-import torch
-import train
-
-# Load tokenizer & model
-tokenizer = train.get_tokenizer()
-model = train.ESM2Small(vocab_size=31, max_len=512)
-ckpt = torch.load("weights/model.pt", map_location="cpu")
-model.load_state_dict(ckpt["model_state_dict"])
-model.eval()
-
-# Encode a protein sequence
-seq = "MVLSPADKTNVKAAWGKVGAHAGEYGAEALERMFLSFPTTKTYFPHFDLSH"
-ids = tokenizer.encode(seq)
-tokens = torch.tensor([ids])
-
-# Masked prediction
-with torch.no_grad():
-    logits = model(tokens)
-    print(tokenizer.decode(logits[0].argmax(dim=-1).tolist()))
-```
-
-## Zero-Shot Mutation Fitness
-
-Evaluated on GFP fluorescence mutations (4 test cases, CPU inference):
-
-| Mutation | Type | WT score | Mut score | Δ |
-|---|---|---|---|---|
-| K7V | neutral | 1.39 | 1.52 | +0.13 |
-| K7I | neutral | 1.39 | 0.40 | -0.99 |
-| G66Y | brighter | 1.70 | 0.33 | -1.37 |
-| G66H | dimer | 1.70 | 0.32 | -1.38 |
-
-Spearman ρ = **0.200** (zero-shot, no fine-tuning)
-
-## Files
-
-```
-weights/
-  model.pt          # Final best checkpoint (110MB)
-  config.json       # Training config
-train.py            # Full training script
-download_data.py    # Swiss-Prot data downloader
-requirements.txt    # Python dependencies
-start_training.sh   # Training launcher
-training.log        # Full training log
-fitness_results.txt # Mutation prediction results
-data/               # Swiss-Prot FASTA (download via script)
-```
-
-## Training from Scratch
+### 1. Install
 
 ```bash
-# 1. Download training data
-python download_data.py
-
-# 2. Train (MLU370)
-bash start_training.sh
-
-# 3. Resume if interrupted
-python train.py --resume output/checkpoint_epoch2.pt
+pip install torch>=2.0 numpy scipy scikit-learn tqdm requests
 ```
+
+### 2. Download Data
+
+```bash
+python scripts/download_data.py --output_dir ./data
+# Output: data/swissprot_train.fasta (~433K seqs), data/swissprot_val.fasta (~22K seqs)
+```
+
+### 3. Train
+
+```bash
+# CUDA (BF16 AMP, recommended)
+bash start_training_cuda.sh 8M
+
+# Cambricon MLU370
+bash start_training.sh 8M
+
+# Manual (any device, full control)
+python train.py \
+    --train_data data/swissprot_train.fasta \
+    --val_data   data/swissprot_val.fasta \
+    --model_size 8M \
+    --device     auto \
+    --out_dir    output/8M
+```
+
+### 4. Evaluate Zero-Shot Fitness
+
+```bash
+# Built-in GFP benchmark (5 mutations, no extra data needed)
+python scripts/evaluate_fitness.py \
+    --checkpoint output/8M/checkpoint_final_best.pt
+
+# ProteinGym CSV (mutant + DMS_score columns)
+python scripts/evaluate_fitness.py \
+    --checkpoint output/8M/checkpoint_final_best.pt \
+    --dms_csv    data/GFP_AVGFP_Sarkisyan2016.csv \
+    --output     results/gfp_fitness.csv
+```
+
+### 5. Evaluate Embedding Quality
+
+```bash
+python scripts/evaluate_embedding.py \
+    --checkpoint output/8M/checkpoint_final_best.pt \
+    --fasta      data/swissprot_val.fasta \
+    --n_seqs     1000 \
+    --tsne
+```
+
+## Training Details
+
+| Parameter | 8M | 35M | 150M |
+|-----------|-----|-----|------|
+| Batch size | 32 | 16 | 8 |
+| Grad accum | 1 | 2 | 4 |
+| Effective batch | 32 | 32 | 32 |
+| Learning rate | 1e-4 | 5e-5 | 3e-5 |
+| Warmup steps | 1000 | 2000 | 4000 |
+| LR schedule | cosine | cosine | cosine |
+| EMA | — | 0.999 | 0.999 |
+| AMP (CUDA) | BF16 | BF16 | BF16 |
+
+## Hardware
+
+- **CUDA**: Any NVIDIA GPU with BF16 support (Ampere+). A100 recommended for 150M.
+- **MLU**: Cambricon MLU370 (FP32, no AMP). Use `start_training.sh`.
+- **CPU**: Supported for small models and evaluation only.
+
+## Resume Training
+
+```bash
+python train.py \
+    --train_data data/swissprot_train.fasta \
+    --val_data   data/swissprot_val.fasta \
+    --model_size 8M \
+    --resume     output/8M/checkpoint_epoch2.pt
+```
+
+## Upload Model
+
+```bash
+python scripts/upload_to_github.py \
+    --repo       junior1p/ESM2-small \
+    --checkpoint output/8M/checkpoint_final_best.pt \
+    --tag        v2.0-8M \
+    --title      "ESM2-8M v2.0 (RoPE, 33-token)" \
+    --token      $GITHUB_TOKEN
+```
+
+## File Structure
+
+```
+ESM2-small/
+├── train.py                    # Main training script
+├── model.py                    # ESMModel with RoPE (8M/35M/150M)
+├── tokenizer.py                # 33-token ESM-2 vocabulary
+├── data.py                     # ProteinDataset + MLM collation
+├── scripts/
+│   ├── download_data.py        # Swiss-Prot downloader
+│   ├── evaluate_fitness.py     # Zero-shot mutation fitness
+│   ├── evaluate_embedding.py   # Embedding quality (k-NN)
+│   └── upload_to_github.py     # Model release uploader
+├── configs/
+│   ├── 8M.json                 # 8M hyperparameters
+│   ├── 35M.json                # 35M hyperparameters
+│   └── 150M.json               # 150M hyperparameters
+├── start_training.sh           # MLU370 launcher
+├── start_training_cuda.sh      # CUDA launcher
+└── weights/                    # Legacy 9.6M checkpoint (v1, 31-token)
+```
+
+## Legacy Model (v1)
+
+The original `weights/model.pt` is a **9.6M parameter model** trained with a 31-token vocabulary
+(no `<cls>` token) on MLU370. It is **not compatible** with the current 33-token tokenizer.
+Kept for reference.
+
+- Val loss: 0.4170 | Spearman ρ (GFP, 4 mutations): 0.200
 
 ## License
 
