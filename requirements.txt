@@ -1,3 +1,6 @@
 torch>=2.0
-requests
-numpy
+numpy>=1.21
+scipy>=1.7
+scikit-learn>=1.0
+tqdm>=4.0
+requests>=2.26
