@@ -1,0 +1,19 @@
+{
+  "model_size": "8M",
+  "n_layers": 6,
+  "d_model": 320,
+  "n_heads": 20,
+  "ffn_dim": 1280,
+  "n_params": 7401280,
+  "vocab_size": 33,
+  "max_len": 512,
+  "batch_size": 32,
+  "grad_accum": 1,
+  "lr": 1e-4,
+  "weight_decay": 0.01,
+  "epochs": 5,
+  "warmup_steps": 1000,
+  "dropout": 0.1,
+  "ema_decay": 0.0,
+  "notes": "Default config. ~8M params, 6 layers, d_model=320."
+}
